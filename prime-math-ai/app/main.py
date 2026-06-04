@@ -7,6 +7,8 @@ Deployed on Render. All endpoints consumed by the website and Streamlit app.
 
 import os
 import logging
+import uuid
+import time
 from typing import Optional
 from contextlib import asynccontextmanager
 
@@ -52,6 +54,11 @@ app.add_middleware(
 )
 
 
+# ── Ingestion status tracking (in-memory) ─────────────────────────────────────
+# Maps job_id → {status, phase, page, total_pages, chunks, detail, started_at, ...}
+_ingest_jobs: dict[str, dict] = {}
+
+
 # ── Pydantic Models ───────────────────────────────────────────────────────────
 
 class TopicRequest(BaseModel):
@@ -87,6 +94,7 @@ class ContentResponse(BaseModel):
     content: str
     sources: list[SourceRef]
     status: str = "success"
+    from_cache: bool = False   # True = served from Redis/shelve, no OpenAI call made
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
@@ -126,7 +134,7 @@ async def lesson_notes(req: TopicRequest):
     try:
         from app.rag import generate_lesson_notes
         result = generate_lesson_notes(req.topic, req.subtopic)
-        return ContentResponse(content=result["content"], sources=result["sources"])
+        return ContentResponse(content=result["content"], sources=result["sources"], from_cache=result.get("from_cache", False))
     except Exception as e:
         log.error(f"lesson_notes error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -138,7 +146,7 @@ async def generate_quiz(req: QuizRequest):
     try:
         from app.rag import generate_quiz
         result = generate_quiz(req.topic, req.difficulty, req.num_questions)
-        return ContentResponse(content=result["content"], sources=result["sources"])
+        return ContentResponse(content=result["content"], sources=result["sources"], from_cache=result.get("from_cache", False))
     except Exception as e:
         log.error(f"quiz error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -150,7 +158,7 @@ async def lesson_plan(req: LessonPlanRequest):
     try:
         from app.rag import generate_lesson_plan
         result = generate_lesson_plan(req.topic, req.duration_minutes)
-        return ContentResponse(content=result["content"], sources=result["sources"])
+        return ContentResponse(content=result["content"], sources=result["sources"], from_cache=result.get("from_cache", False))
     except Exception as e:
         log.error(f"lesson_plan error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -162,7 +170,7 @@ async def real_life_examples(req: RealLifeRequest):
     try:
         from app.rag import generate_real_life_examples
         result = generate_real_life_examples(req.topic, req.context_country)
-        return ContentResponse(content=result["content"], sources=result["sources"])
+        return ContentResponse(content=result["content"], sources=result["sources"], from_cache=result.get("from_cache", False))
     except Exception as e:
         log.error(f"real_life error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -175,9 +183,30 @@ async def chat(req: ChatRequest):
         from app.rag import chat_with_textbook
         history = [{"role": m.role, "content": m.content} for m in req.history]
         result  = chat_with_textbook(req.query, history)
-        return ContentResponse(content=result["content"], sources=result["sources"])
+        return ContentResponse(content=result["content"], sources=result["sources"], from_cache=result.get("from_cache", False))
     except Exception as e:
         log.error(f"chat error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/cache/stats", tags=["Admin"])
+async def get_cache_stats():
+    """Show Redis cache statistics — useful for verifying cache is working."""
+    try:
+        from app.rag import cache_stats
+        return cache_stats()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/cache/clear", tags=["Admin"])
+async def clear_cache():
+    """Clear all cached responses (use after re-ingesting textbook)."""
+    try:
+        from app.rag import cache_clear
+        cache_clear()
+        return {"status": "cleared"}
+    except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -200,12 +229,56 @@ async def ingest_pdf(
     with open(save_path, "wb") as f:
         f.write(contents)
 
+    job_id = str(uuid.uuid4())[:8]
+    _ingest_jobs[job_id] = {
+        "status": "starting",
+        "phase": "init",
+        "page": 0,
+        "total_pages": 0,
+        "chunks": 0,
+        "detail": "Uploading complete, starting ingestion...",
+        "filename": file.filename,
+        "started_at": time.time(),
+    }
+
+    def _progress_cb(update: dict):
+        """Called by the ingestion script to report progress."""
+        job = _ingest_jobs.get(job_id)
+        if job:
+            job["status"] = "completed" if update.get("phase") == "completed" else "processing"
+            job["phase"] = update.get("phase", job["phase"])
+            job["page"] = update.get("page", job["page"])
+            job["total_pages"] = update.get("total_pages", job["total_pages"])
+            job["chunks"] = update.get("chunks", job["chunks"])
+            job["detail"] = update.get("detail", job["detail"])
+
     def run_ingest():
-        from scripts.ingest_textbook import ingest_pdf as do_ingest
-        do_ingest(save_path, start_page, end_page)
+        try:
+            from scripts.ingest_textbook import ingest_pdf as do_ingest
+            do_ingest(save_path, start_page, end_page, progress_callback=_progress_cb)
+        except Exception as e:
+            log.error(f"Ingestion failed for job {job_id}: {e}")
+            job = _ingest_jobs.get(job_id)
+            if job:
+                job["status"] = "failed"
+                job["detail"] = f"Error: {str(e)[:200]}"
 
     background_tasks.add_task(run_ingest)
-    return {"message": f"Ingestion started for '{file.filename}'", "status": "processing"}
+    return {"message": f"Ingestion started for '{file.filename}'", "status": "processing", "job_id": job_id}
+
+
+@app.get("/ingest/status", tags=["Admin"])
+async def ingest_status(job_id: Optional[str] = None):
+    """Check the status of an ingestion job. If no job_id, return the latest job."""
+    if not _ingest_jobs:
+        return {"status": "no_jobs", "detail": "No ingestion jobs have been started"}
+
+    if job_id and job_id in _ingest_jobs:
+        return {"job_id": job_id, **_ingest_jobs[job_id]}
+
+    # Return the most recent job
+    latest_id = list(_ingest_jobs.keys())[-1]
+    return {"job_id": latest_id, **_ingest_jobs[latest_id]}
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

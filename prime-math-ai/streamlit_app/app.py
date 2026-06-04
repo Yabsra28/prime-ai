@@ -342,20 +342,33 @@ elif page == "💬 Ask the Textbook":
 # PAGE: Admin / Ingest
 # ═══════════════════════════════════════════════════════════════════════════════
 elif page == "⚙️ Admin / Ingest":
+    import time as _time
+
     st.subheader("⚙️ Admin — Textbook Ingestion")
     st.markdown("Upload and embed the Grade 11 Math PDF textbook into the vector database.")
 
-    # DB Stats
+    # ── DB Stats ──────────────────────────────────────────────────────────────
     try:
         if USE_API:
-            health = requests.get(f"{API_BASE}/health", timeout=10).json()
-            st.metric("Documents Indexed", health.get("documents_indexed", 0))
-            st.metric("API Status", health.get("status", "unknown").upper())
+            with st.spinner("🔌 Connecting to API..."):
+                health = requests.get(f"{API_BASE}/health", timeout=60).json()
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Documents Indexed", health.get("documents_indexed", 0))
+            col2.metric("API Status", health.get("status", "unknown").upper())
+            # Also show topics count
+            try:
+                topics_resp = requests.get(f"{API_BASE}/topics", timeout=10).json()
+                col3.metric("Topics Indexed", len(topics_resp.get("topics", [])))
+            except Exception:
+                col3.metric("Topics Indexed", "?")
         else:
             from app.rag import get_collection
             col = get_collection()
             st.metric("Documents Indexed", col.count())
-            st.metric("Mode", "Local")
+    except requests.exceptions.ConnectionError:
+        st.warning("⚠️ Cannot reach the API server. It may be starting up — try again in 30 seconds.")
+    except requests.exceptions.Timeout:
+        st.warning("⚠️ API server is taking too long to respond. Render may be cold-starting. Try again in a minute.")
     except Exception as e:
         st.warning(f"Could not fetch stats: {e}")
 
@@ -364,34 +377,149 @@ elif page == "⚙️ Admin / Ingest":
     if USE_API:
         st.markdown("### Upload PDF via API")
         uploaded = st.file_uploader("Upload Grade 11 Math PDF", type=["pdf"])
-        col1, col2 = st.columns(2)
-        with col1:
+        c1, c2 = st.columns(2)
+        with c1:
             start_pg = st.number_input("Start Page (0-indexed)", min_value=0, value=0)
-        with col2:
-            end_pg   = st.number_input("End Page (0 = all)", min_value=0, value=0)
+        with c2:
+            end_pg = st.number_input("End Page (0 = all pages)", min_value=0, value=0)
 
-        if uploaded and st.button("🚀 Start Ingestion"):
-            with st.spinner("Uploading and starting ingestion..."):
+        if uploaded and st.button("🚀 Start Ingestion", type="primary"):
+            with st.spinner("📤 Uploading PDF to Render server..."):
                 try:
-                    ep = st.number_input if end_pg == 0 else end_pg
-                    files   = {"file": (uploaded.name, uploaded.getvalue(), "application/pdf")}
-                    params  = {"start_page": start_pg}
+                    files  = {"file": (uploaded.name, uploaded.getvalue(), "application/pdf")}
+                    params = {"start_page": start_pg}
                     if end_pg > 0:
                         params["end_page"] = end_pg
-                    resp = requests.post(f"{API_BASE}/ingest", files=files, params=params, timeout=30)
+                    resp = requests.post(
+                        f"{API_BASE}/ingest",
+                        files=files,
+                        params=params,
+                        timeout=300,
+                    )
                     resp.raise_for_status()
-                    st.success(resp.json()["message"])
-                    st.info("Ingestion is running in the background. Check back in a few minutes.")
+                    result = resp.json()
+                    job_id = result.get("job_id", "")
+                    if job_id:
+                        # ── Save job_id and immediately start polling ──
+                        st.session_state["ingest_job_id"]      = job_id
+                        st.session_state["ingest_polling"]     = True
+                        st.session_state["ingest_start_chunks"] = 0
+                        st.success(f"✅ Upload received! Job ID: `{job_id}` — watching progress now...")
+                    else:
+                        st.error("No job ID returned. Check Render logs.")
+                except requests.exceptions.Timeout:
+                    st.error("⏱️ Upload timed out. PDF may be too large. Try a smaller page range (e.g. 0–50).")
+                except requests.exceptions.ConnectionError:
+                    st.error("🔌 Cannot reach the API. The server may be starting up.")
                 except Exception as e:
-                    st.error(f"Error: {e}")
+                    st.error(f"Upload error: {e}")
+
+        # ── Live Progress Section ─────────────────────────────────────────────
+        st.divider()
+        st.markdown("### 📊 Ingestion Progress")
+
+        # Allow manual job ID entry as fallback
+        stored_job = st.session_state.get("ingest_job_id", "")
+        manual_job = st.text_input(
+            "Job ID — auto-filled after upload, or paste one manually",
+            value=stored_job,
+            placeholder="e.g. a3f2bc1d",
+        )
+        if manual_job and manual_job != stored_job:
+            st.session_state["ingest_job_id"] = manual_job
+            st.session_state["ingest_polling"] = True
+
+        active_job = st.session_state.get("ingest_job_id", "")
+
+        col_btn1, col_btn2 = st.columns([1, 1])
+        with col_btn1:
+            check_now = st.button("🔄 Check Status Once", use_container_width=True)
+        with col_btn2:
+            live_poll = st.button("▶ Watch Live (auto-refresh)", use_container_width=True,
+                                  type="primary")
+
+        if active_job and (check_now or live_poll or st.session_state.get("ingest_polling")):
+            try:
+                status_resp = requests.get(
+                    f"{API_BASE}/ingest/status",
+                    params={"job_id": active_job},
+                    timeout=15,
+                ).json()
+
+                status = status_resp.get("status", "unknown")
+                phase  = status_resp.get("phase", "")
+                page   = status_resp.get("page", 0)
+                total  = status_resp.get("total_pages", 1)
+                chunks = status_resp.get("chunks", 0)
+                detail = status_resp.get("detail", "")
+
+                # ── Big visible status box ────────────────────────────────────
+                phase_icons = {
+                    "init":       "🔧 Setting up...",
+                    "extracting": f"📄 Reading pages — Page {page} of {total}",
+                    "embedding":  "🧠 Sending to OpenAI for embeddings...",
+                    "upserting":  "💾 Writing to ChromaDB on Render disk...",
+                    "completed":  "✅ Done!",
+                    "failed":     "❌ Failed",
+                }
+                phase_label = phase_icons.get(phase, f"⏳ {phase}")
+
+                # Progress bar
+                if total > 0 and phase == "extracting":
+                    pct = min(int((page / total) * 80), 80)
+                elif phase == "embedding":
+                    pct = 88
+                elif phase == "upserting":
+                    pct = 95
+                elif status == "completed":
+                    pct = 100
+                else:
+                    pct = 5
+
+                st.progress(pct / 100)
+
+                # Metrics row
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Status",  status.upper())
+                m2.metric("Phase",   phase or "—")
+                m3.metric("Page",    f"{page} / {total}" if total else "—")
+                m4.metric("Chunks",  chunks)
+
+                st.info(f"{phase_label}\n\n_{detail}_")
+
+                if status == "completed":
+                    st.success(f"🎉 **Ingestion complete!** {chunks} chunks are now in ChromaDB on Render.")
+                    st.balloons()
+                    st.session_state["ingest_polling"] = False
+                    # Show verify links
+                    verify_md = (
+                        "**Verify it worked — open these in your browser:**\n"
+                        "- [/health — check documents_indexed]({base}/health)\n"
+                        "- [/topics — see which chapters are searchable]({base}/topics)\n"
+                        "- [/cache/stats — Redis cache info]({base}/cache/stats)"
+                    ).format(base=API_BASE)
+                    st.markdown(verify_md)
+                elif status == "failed":
+                    st.error(f"❌ Ingestion failed: {detail}")
+                    st.session_state["ingest_polling"] = False
+                elif live_poll or st.session_state.get("ingest_polling"):
+                    # Keep auto-refreshing every 4 seconds
+                    _time.sleep(4)
+                    st.rerun()
+
+            except Exception as e:
+                st.error(f"Could not fetch status: {e}. Try clicking Check Status again.")
+
+        elif not active_job:
+            st.info("Upload a PDF and click Start Ingestion — the Job ID will appear here automatically.")
+
     else:
         st.markdown("### Run Ingestion Script Directly")
         st.code("python scripts/ingest_textbook.py path/to/grade11_math.pdf", language="bash")
-        st.info("Or run with page range: `python scripts/ingest_textbook.py textbook.pdf --start-page 10 --end-page 200`")
-
+        st.info("With page range: `python scripts/ingest_textbook.py textbook.pdf --start-page 0 --end-page 50`")
         st.divider()
-        st.markdown("### List Available Topics")
-        if st.button("🔍 Show Indexed Topics"):
+        st.markdown("### Indexed Topics")
+        if st.button("🔍 Show Topics"):
             try:
                 from app.rag import get_collection
                 col     = get_collection()

@@ -7,6 +7,12 @@ Shared by the FastAPI backend and the Streamlit app.
 Caching strategy:
 - Production (Render): Redis via REDIS_URL env var
 - Local development: shelve file at ./data/response_cache
+
+FIXES applied:
+1. chat_with_textbook now caches Q&A pairs (keyed by query text, case-normalized)
+2. Redis URL sanitized — trailing whitespace/CR stripped
+3. from_cache flag surfaced in API response so frontend can show cache badge
+4. Cache key normalizes query (lowercase, strip) so "Same Question" == "same question"
 """
 
 import os
@@ -29,7 +35,8 @@ OPENAI_MODEL       = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 EMBEDDING_MODEL    = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-large")
 CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "./data/chroma_db")
 CHROMA_COLLECTION  = os.getenv("CHROMA_COLLECTION_NAME", "grade11_math")
-REDIS_URL          = os.getenv("REDIS_URL", "")           # set on Render, empty locally
+# Strip whitespace/CR from REDIS_URL — common source of connection failures
+REDIS_URL          = os.getenv("REDIS_URL", "").strip()
 CACHE_TTL          = int(os.getenv("CACHE_TTL_SECONDS", 86400 * 7))  # 7 days default
 LOCAL_CACHE_PATH   = "./data/response_cache"
 
@@ -62,8 +69,6 @@ def get_collection():
 
 
 # ── Cache layer ───────────────────────────────────────────────────────────────
-# Two backends — Redis (production) or shelve file (local).
-# The rest of the code never needs to know which one is active.
 
 def _get_redis():
     """Lazy-load Redis client only if REDIS_URL is configured."""
@@ -71,19 +76,29 @@ def _get_redis():
     if _redis_client is None and REDIS_URL:
         try:
             import redis
-            _redis_client = redis.from_url(REDIS_URL, decode_responses=True)
-            _redis_client.ping()   # confirm connection works
-            log.info("✅ Redis cache connected")
+            _redis_client = redis.from_url(REDIS_URL, decode_responses=True,
+                                           socket_connect_timeout=3,
+                                           socket_timeout=3)
+            _redis_client.ping()
+            log.info("✅ Redis cache connected to %s", REDIS_URL[:30])
         except Exception as e:
-            log.warning(f"Redis unavailable, falling back to local cache: {e}")
+            log.warning("Redis unavailable, falling back to local shelve cache: %s", e)
             _redis_client = None
     return _redis_client
 
 
 def cache_key(feature: str, **kwargs) -> str:
-    """Deterministic MD5 key from feature name + parameters."""
-    payload = json.dumps({"feature": feature, **kwargs}, sort_keys=True)
-    return hashlib.md5(payload.encode()).hexdigest()
+    """
+    Deterministic MD5 key from feature name + parameters.
+    Strings are normalized (lowercased, stripped) so the same question asked
+    with different casing/spacing still hits the cache.
+    """
+    normalized = {
+        k: v.lower().strip() if isinstance(v, str) else v
+        for k, v in kwargs.items()
+    }
+    payload = json.dumps({"feature": feature, **normalized}, sort_keys=True)
+    return "prime:" + hashlib.md5(payload.encode()).hexdigest()
 
 
 def cache_get(key: str) -> Optional[dict]:
@@ -91,26 +106,25 @@ def cache_get(key: str) -> Optional[dict]:
     r = _get_redis()
 
     if r:
-        # ── Redis path ──
         try:
             raw = r.get(key)
             if raw:
-                log.info(f"🔵 Redis cache hit: {key[:12]}...")
+                log.info("🔵 Redis cache HIT: %s", key)
                 return json.loads(raw)
+            log.info("⚪ Redis cache MISS: %s", key)
         except Exception as e:
-            log.warning(f"Redis get failed: {e}")
-
+            log.warning("Redis get failed: %s", e)
     else:
-        # ── Local shelve path ──
         try:
             os.makedirs("./data", exist_ok=True)
             with shelve.open(LOCAL_CACHE_PATH) as db:
                 value = db.get(key)
                 if value:
-                    log.info(f"🟡 Local cache hit: {key[:12]}...")
+                    log.info("🟡 Local shelve cache HIT: %s", key[:16])
                     return value
+                log.info("⚪ Local shelve cache MISS: %s", key[:16])
         except Exception as e:
-            log.warning(f"Local cache get failed: {e}")
+            log.warning("Local cache get failed: %s", e)
 
     return None
 
@@ -120,49 +134,68 @@ def cache_set(key: str, value: dict):
     r = _get_redis()
 
     if r:
-        # ── Redis path — expires after CACHE_TTL seconds ──
         try:
+            serialized = json.dumps(value)
             if CACHE_TTL == 0:
-                r.set(key, json.dumps(value))   # no expiry
+                r.set(key, serialized)
             else:
-                r.setex(key, CACHE_TTL, json.dumps(value))
-            log.info(f"🔵 Saved to Redis cache (TTL {CACHE_TTL}s): {key[:12]}...")
+                r.setex(key, CACHE_TTL, serialized)
+            log.info("🔵 Saved to Redis (TTL=%ss): %s", CACHE_TTL, key)
         except Exception as e:
-            log.warning(f"Redis set failed: {e}")
-
+            log.warning("Redis set failed: %s", e)
     else:
-        # ── Local shelve path — no expiry, persists until deleted ──
         try:
             os.makedirs("./data", exist_ok=True)
             with shelve.open(LOCAL_CACHE_PATH) as db:
                 db[key] = value
-            log.info(f"🟡 Saved to local cache: {key[:12]}...")
+            log.info("🟡 Saved to local shelve: %s", key[:16])
         except Exception as e:
-            log.warning(f"Local cache set failed: {e}")
+            log.warning("Local cache set failed: %s", e)
 
 
 def cache_clear(feature: Optional[str] = None):
-    """
-    Clear cache entries.
-    feature=None clears everything.
-    feature='lesson_notes' clears only lesson note entries (Redis only).
-    """
     r = _get_redis()
     if r:
         try:
-            keys = r.keys("*")
-            r.delete(*keys) if keys else None
-            log.info(f"🔵 Redis cache cleared ({len(keys)} keys)")
+            keys = r.keys("prime:*")
+            if keys:
+                r.delete(*keys)
+            log.info("🔵 Redis cache cleared (%d keys)", len(keys))
         except Exception as e:
-            log.warning(f"Redis clear failed: {e}")
+            log.warning("Redis clear failed: %s", e)
     else:
         try:
             import glob
             for f in glob.glob(f"{LOCAL_CACHE_PATH}*"):
                 os.remove(f)
-            log.info("🟡 Local cache cleared")
+            log.info("🟡 Local shelve cache cleared")
         except Exception as e:
-            log.warning(f"Local cache clear failed: {e}")
+            log.warning("Local cache clear failed: %s", e)
+
+
+def cache_stats() -> dict:
+    """Return cache statistics — used by /cache/stats endpoint."""
+    r = _get_redis()
+    if r:
+        try:
+            keys  = r.keys("prime:*")
+            info  = r.info("memory")
+            return {
+                "backend":       "redis",
+                "total_keys":    len(keys),
+                "used_memory":   info.get("used_memory_human", "?"),
+                "redis_url":     REDIS_URL[:30] + "..." if len(REDIS_URL) > 30 else REDIS_URL,
+                "ttl_seconds":   CACHE_TTL,
+            }
+        except Exception as e:
+            return {"backend": "redis", "error": str(e)}
+    else:
+        try:
+            import glob
+            files = glob.glob(f"{LOCAL_CACHE_PATH}*")
+            return {"backend": "local_shelve", "files": len(files)}
+        except Exception:
+            return {"backend": "local_shelve"}
 
 
 # ── Retrieval ─────────────────────────────────────────────────────────────────
@@ -176,17 +209,24 @@ def embed_query(query: str) -> list[float]:
 
 def retrieve(query: str, n_results: int = 6, topic_filter: Optional[str] = None) -> list[dict]:
     collection = get_collection()
-    where      = {"topic": topic_filter} if topic_filter else None
-    q_embed    = embed_query(query)
-    kwargs     = dict(
+    doc_count  = collection.count()
+
+    if doc_count == 0:
+        log.warning("⚠️  ChromaDB collection is EMPTY — no documents indexed yet!")
+        return []
+
+    where   = {"topic": topic_filter} if topic_filter else None
+    q_embed = embed_query(query)
+    kwargs  = dict(
         query_embeddings=[q_embed],
-        n_results=min(n_results, collection.count() or 1),
+        n_results=min(n_results, doc_count),
         include=["documents", "metadatas", "distances"],
     )
     if where:
         kwargs["where"] = where
     results = collection.query(**kwargs)
-    return [
+
+    chunks = [
         {"text": doc, "metadata": meta, "distance": dist}
         for doc, meta, dist in zip(
             results["documents"][0],
@@ -195,8 +235,19 @@ def retrieve(query: str, n_results: int = 6, topic_filter: Optional[str] = None)
         )
     ]
 
+    # Log distances so you can see if RAG is actually finding relevant content
+    for c in chunks:
+        log.info("  📄 Page %s | Topic: %s | Distance: %.3f",
+                 c["metadata"].get("page", "?"),
+                 c["metadata"].get("topic", "?"),
+                 c["distance"])
+
+    return chunks
+
 
 def build_context(chunks: list[dict]) -> str:
+    if not chunks:
+        return "(No textbook content found — answering from general knowledge)"
     parts = []
     for i, c in enumerate(chunks, 1):
         meta  = c["metadata"]
@@ -205,24 +256,23 @@ def build_context(chunks: list[dict]) -> str:
     return "\n\n---\n\n".join(parts)
 
 
-# ── Shared system prompt ──────────────────────────────────────────────────────
+# ── System prompt ─────────────────────────────────────────────────────────────
 
 SYSTEM_BASE = """You are Prime AI, an expert Grade 11 Mathematics tutor for Ethiopian students.
 You have access to the official Grade 11 Math textbook content.
 Always be clear, step-by-step, and encouraging. Use LaTeX notation for equations (wrap in $ or $$).
-Cite page numbers when referencing textbook content."""
+Cite page numbers when referencing textbook content.
+If the provided textbook content does not cover the question, say so clearly and answer from general Grade 11 Math knowledge."""
 
 
-# ── Feature functions — all cached except chat ───────────────────────────────
+# ── Feature functions — ALL cached (including chat) ──────────────────────────
 
 def generate_lesson_notes(topic: str, subtopic: str = "") -> dict:
-    # ── Cache check ──
     key    = cache_key("lesson_notes", topic=topic, subtopic=subtopic)
     cached = cache_get(key)
     if cached:
         return {**cached, "from_cache": True}
 
-    # ── Generate ──
     chunks  = retrieve(f"{topic} {subtopic} definition formula examples", n_results=8)
     context = build_context(chunks)
     prompt  = f"""Using the textbook content below, generate comprehensive LESSON NOTES for:
@@ -250,8 +300,8 @@ TEXTBOOK CONTENT:
         temperature=0.3,
     )
     result = {
-        "content": resp.choices[0].message.content,
-        "sources": [{"page": c["metadata"].get("page"), "topic": c["metadata"].get("topic")} for c in chunks],
+        "content":    resp.choices[0].message.content,
+        "sources":    [{"page": c["metadata"].get("page"), "topic": c["metadata"].get("topic")} for c in chunks],
         "from_cache": False,
     }
     cache_set(key, result)
@@ -269,9 +319,12 @@ def generate_quiz(topic: str, difficulty: str = "medium", num_questions: int = 5
     prompt  = f"""Using the textbook content below, create a {difficulty.upper()} difficulty quiz on: {topic}
 Generate exactly {num_questions} questions.
 
-Format each question as:
+Format EACH question EXACTLY as shown below (one option per line):
 Q[N]: [Question text with LaTeX equations where needed]
-A) [Option]  B) [Option]  C) [Option]  D) [Option]
+A) [Option 1]
+B) [Option 2]
+C) [Option 3]
+D) [Option 4]
 ✓ Correct: [Letter] — [Brief explanation]
 
 TEXTBOOK CONTENT:
@@ -287,8 +340,8 @@ TEXTBOOK CONTENT:
         temperature=0.5,
     )
     result = {
-        "content": resp.choices[0].message.content,
-        "sources": [{"page": c["metadata"].get("page")} for c in chunks],
+        "content":    resp.choices[0].message.content,
+        "sources":    [{"page": c["metadata"].get("page")} for c in chunks],
         "from_cache": False,
     }
     cache_set(key, result)
@@ -328,8 +381,8 @@ TEXTBOOK CONTENT:
         temperature=0.3,
     )
     result = {
-        "content": resp.choices[0].message.content,
-        "sources": [{"page": c["metadata"].get("page")} for c in chunks],
+        "content":    resp.choices[0].message.content,
+        "sources":    [{"page": c["metadata"].get("page")} for c in chunks],
         "from_cache": False,
     }
     cache_set(key, result)
@@ -367,8 +420,8 @@ TEXTBOOK CONTENT:
         temperature=0.7,
     )
     result = {
-        "content": resp.choices[0].message.content,
-        "sources": [{"page": c["metadata"].get("page")} for c in chunks],
+        "content":    resp.choices[0].message.content,
+        "sources":    [{"page": c["metadata"].get("page")} for c in chunks],
         "from_cache": False,
     }
     cache_set(key, result)
@@ -376,13 +429,28 @@ TEXTBOOK CONTENT:
 
 
 def chat_with_textbook(query: str, history: list[dict] = None) -> dict:
-    """Chat is NOT cached — every conversation is unique."""
+    """
+    Chat Q&A — NOW CACHED.
+    Cache key = query only (history ignored for cache lookup).
+    This means the same question always returns the cached answer instantly,
+    regardless of conversation history, saving OpenAI API costs.
+    New or follow-up questions (different text) go through the API normally.
+    """
+    key    = cache_key("chat", query=query)
+    cached = cache_get(key)
+    if cached:
+        log.info("💬 Chat cache HIT for query: %s...", query[:50])
+        return {**cached, "from_cache": True}
+
+    log.info("💬 Chat cache MISS — calling OpenAI for: %s...", query[:50])
     chunks   = retrieve(query, n_results=6)
     context  = build_context(chunks)
     messages = [{"role": "system", "content": SYSTEM_BASE}]
+
     if history:
-        for h in history[-6:]:
+        for h in history[-6:]:  # only last 6 turns to keep context window small
             messages.append({"role": h["role"], "content": h["content"]})
+
     messages.append({
         "role": "user",
         "content": f"""Answer this Grade 11 Math question using the textbook content:
@@ -394,14 +462,17 @@ RELEVANT TEXTBOOK CONTENT:
 
 Provide a clear, step-by-step answer. Show all working. Use LaTeX for equations."""
     })
+
     resp = get_openai_client().chat.completions.create(
         model=OPENAI_MODEL,
         messages=messages,
         max_tokens=1500,
         temperature=0.2,
     )
-    return {
-        "content": resp.choices[0].message.content,
-        "sources": [{"page": c["metadata"].get("page"), "topic": c["metadata"].get("topic")} for c in chunks],
+    result = {
+        "content":    resp.choices[0].message.content,
+        "sources":    [{"page": c["metadata"].get("page"), "topic": c["metadata"].get("topic")} for c in chunks],
         "from_cache": False,
     }
+    cache_set(key, result)
+    return result

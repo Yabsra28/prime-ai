@@ -203,13 +203,40 @@ def detect_topic(text: str) -> str:
 
 # ── Main ingestion ────────────────────────────────────────────────────────────
 
-def ingest_pdf(pdf_path: str, start_page: int = 0, end_page: Optional[int] = None):
+def ingest_pdf(pdf_path: str, start_page: int = 0, end_page: Optional[int] = None,
+               progress_callback=None):
+    """
+    Ingest a PDF into ChromaDB.
+
+    Args:
+        pdf_path: Path to the PDF file.
+        start_page: 0-indexed start page.
+        end_page: 0-indexed end page (None = all pages).
+        progress_callback: Optional callable(dict) that receives progress updates:
+            {"phase": str, "page": int, "total_pages": int, "chunks": int, "detail": str}
+    """
+    def _notify(phase, page=0, total_pages=0, chunks=0, detail=""):
+        if progress_callback:
+            try:
+                progress_callback({
+                    "phase": phase,
+                    "page": page,
+                    "total_pages": total_pages,
+                    "chunks": chunks,
+                    "detail": detail,
+                })
+            except Exception:
+                pass  # Never let callback errors break ingestion
+
     log.info(f"Opening PDF: {pdf_path}")
     log.info(f"Using model: {OPENAI_MODEL} | Embeddings: {EMBEDDING_MODEL}")
     doc      = fitz.open(pdf_path)
     total    = len(doc)
     end_page = end_page or total
-    log.info(f"Pages to process: {start_page} → {end_page} (of {total} total)")
+    pages_to_process = min(end_page, total)
+    log.info(f"Pages to process: {start_page} → {pages_to_process} (of {total} total)")
+
+    _notify("init", total_pages=pages_to_process - start_page, detail="Opening PDF and connecting to ChromaDB")
 
     # ── ChromaDB ──
     chroma = chromadb.PersistentClient(
@@ -230,9 +257,14 @@ def ingest_pdf(pdf_path: str, start_page: int = 0, end_page: Optional[int] = Non
     seen_img_hashes = set()  # catch duplicate images across pages
     api_calls    = 0
 
-    for page_num in range(start_page, min(end_page, total)):
-        page     = doc[page_num]
+    for page_num in range(start_page, pages_to_process):
+        page       = doc[page_num]
+        page_index = page_num - start_page + 1
+        total_to_do = pages_to_process - start_page
         log.info(f"Processing page {page_num + 1}/{total}")
+
+        _notify("extracting", page=page_index, total_pages=total_to_do,
+                chunks=len(all_chunks), detail=f"Processing page {page_num + 1}")
 
         # ── Step 1: Text extraction or OCR ──────────────────────────────────
         raw_text  = page.get_text("text").strip()
@@ -240,6 +272,8 @@ def ingest_pdf(pdf_path: str, start_page: int = 0, end_page: Optional[int] = Non
 
         if is_scanned:
             log.info(f"  → Scanned page — running OCR")
+            _notify("extracting", page=page_index, total_pages=total_to_do,
+                    chunks=len(all_chunks), detail=f"OCR on scanned page {page_num + 1}")
             page_b64 = pdf_page_to_image_b64(page)
             raw_text = ocr_page(page_b64)
             api_calls += 1
@@ -257,9 +291,6 @@ def ingest_pdf(pdf_path: str, start_page: int = 0, end_page: Optional[int] = Non
                 all_chunks.append(chunk)
 
         # ── Step 2: Embedded images / graphs ────────────────────────────────
-        # KEY OPTIMIZATION: if the page was scanned, the OCR already captured
-        # all text content including box text. Only process images on
-        # non-scanned pages, or if the image is large enough to be a real diagram.
         images = page.get_images(full=True)
 
         if not images:
@@ -299,6 +330,8 @@ def ingest_pdf(pdf_path: str, start_page: int = 0, end_page: Optional[int] = Non
 
         for img_i, b64, w, h, raw_bytes in image_candidates:
             log.info(f"     ✓ Image {img_i}: {w}×{h}px {raw_bytes//1024}KB — describing...")
+            _notify("extracting", page=page_index, total_pages=total_to_do,
+                    chunks=len(all_chunks), detail=f"Describing image on page {page_num + 1}")
             description = describe_image(b64, w, h, context_hint=raw_text[:200])
             api_calls  += 1
             topic       = detect_topic(description)
@@ -314,6 +347,8 @@ def ingest_pdf(pdf_path: str, start_page: int = 0, end_page: Optional[int] = Non
 
     doc.close()
     log.info(f"Total API vision/OCR calls made: {api_calls}")
+
+    _notify("embedding", chunks=len(all_chunks), detail="Deduplicating and preparing embeddings")
 
     # ── Deduplicate against existing collection ──────────────────────────────
     seen    = set()
@@ -331,6 +366,8 @@ def ingest_pdf(pdf_path: str, start_page: int = 0, end_page: Optional[int] = Non
 
     log.info(f"New chunks to embed: {len(unique)} (skipped {len(all_chunks) - len(unique)} duplicates)")
 
+    _notify("embedding", chunks=len(unique), detail=f"Embedding {len(unique)} new chunks")
+
     # ── Upsert into ChromaDB ─────────────────────────────────────────────────
     UPSERT_BATCH = 50
     for i in range(0, len(unique), UPSERT_BATCH):
@@ -340,9 +377,15 @@ def ingest_pdf(pdf_path: str, start_page: int = 0, end_page: Optional[int] = Non
         metas  = [c["metadata"] for _, c in batch]
         embeds = embed_texts(texts)
         collection.upsert(ids=ids, documents=texts, embeddings=embeds, metadatas=metas)
-        log.info(f"  Upserted batch {i//UPSERT_BATCH + 1} ({len(batch)} chunks)")
+        batch_num = i // UPSERT_BATCH + 1
+        total_batches = (len(unique) + UPSERT_BATCH - 1) // UPSERT_BATCH
+        log.info(f"  Upserted batch {batch_num} ({len(batch)} chunks)")
+        _notify("upserting", chunks=len(unique),
+                detail=f"Upserted batch {batch_num}/{total_batches}")
 
-    log.info(f"✅ Ingestion complete. Collection now has {collection.count()} documents.")
+    final_count = collection.count()
+    log.info(f"✅ Ingestion complete. Collection now has {final_count} documents.")
+    _notify("completed", chunks=final_count, detail=f"Done! {final_count} documents in collection")
 
 
 if __name__ == "__main__":
