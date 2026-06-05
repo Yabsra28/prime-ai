@@ -18,8 +18,7 @@ import logging
 from typing import Optional
 
 import fitz  # PyMuPDF
-import chromadb
-from chromadb.config import Settings
+# chromadb replaced by Qdrant Cloud
 from openai import OpenAI
 from PIL import Image
 import io
@@ -238,20 +237,11 @@ def ingest_pdf(pdf_path: str, start_page: int = 0, end_page: Optional[int] = Non
 
     _notify("init", total_pages=pages_to_process - start_page, detail="Opening PDF and connecting to ChromaDB")
 
-    # ── ChromaDB ──
-    chroma = chromadb.PersistentClient(
-        path=CHROMA_PERSIST_DIR,
-        settings=Settings(anonymized_telemetry=False)
-    )
-    try:
-        collection = chroma.get_collection(CHROMA_COLLECTION)
-        log.info(f"Loaded existing collection '{CHROMA_COLLECTION}' with {collection.count()} docs")
-    except Exception:
-        collection = chroma.create_collection(
-            name=CHROMA_COLLECTION,
-            metadata={"hnsw:space": "cosine"}
-        )
-        log.info(f"Created new collection '{CHROMA_COLLECTION}'")
+    # ── Qdrant Cloud ──
+    from app.rag import ensure_collection, get_existing_ids, upsert_chunks as _qdrant_upsert
+    ensure_collection()
+    existing_ids = get_existing_ids()
+    log.info(f"Qdrant ready — {len(existing_ids)} existing chunks in collection")
 
     all_chunks   = []
     seen_img_hashes = set()  # catch duplicate images across pages
@@ -350,42 +340,39 @@ def ingest_pdf(pdf_path: str, start_page: int = 0, end_page: Optional[int] = Non
 
     _notify("embedding", chunks=len(all_chunks), detail="Deduplicating and preparing embeddings")
 
-    # ── Deduplicate against existing collection ──────────────────────────────
-    seen    = set()
-    unique  = []
-    try:
-        existing = set(collection.get(include=[])["ids"])
-    except Exception:
-        existing = set()
-
+    # ── Deduplicate + Upsert into Qdrant Cloud ──────────────────────────────
+    seen   = set()
+    unique = []
     for chunk in all_chunks:
         uid = hashlib.md5(chunk["text"].encode()).hexdigest()
-        if uid not in seen and uid not in existing:
+        if uid not in seen and uid not in existing_ids:
             seen.add(uid)
-            unique.append((uid, chunk))
+            unique.append(chunk)
 
-    log.info(f"New chunks to embed: {len(unique)} (skipped {len(all_chunks) - len(unique)} duplicates)")
-
+    skipped = len(all_chunks) - len(unique)
+    log.info(f"New chunks to embed: {len(unique)} (skipped {skipped} duplicates)")
     _notify("embedding", chunks=len(unique), detail=f"Embedding {len(unique)} new chunks")
 
-    # ── Upsert into ChromaDB ─────────────────────────────────────────────────
-    UPSERT_BATCH = 50
+    # ── Embed and upsert in batches ──────────────────────────────────────────
+    UPSERT_BATCH  = 50
+    total_written = 0
+    total_batches = (len(unique) + UPSERT_BATCH - 1) // UPSERT_BATCH
+
     for i in range(0, len(unique), UPSERT_BATCH):
         batch  = unique[i:i+UPSERT_BATCH]
-        ids    = [uid for uid, _ in batch]
-        texts  = [c["text"] for _, c in batch]
-        metas  = [c["metadata"] for _, c in batch]
+        texts  = [c["text"] for c in batch]
         embeds = embed_texts(texts)
-        collection.upsert(ids=ids, documents=texts, embeddings=embeds, metadatas=metas)
+        written = _qdrant_upsert(batch, embeds, existing_ids)
+        total_written += written
         batch_num = i // UPSERT_BATCH + 1
-        total_batches = (len(unique) + UPSERT_BATCH - 1) // UPSERT_BATCH
-        log.info(f"  Upserted batch {batch_num} ({len(batch)} chunks)")
-        _notify("upserting", chunks=len(unique),
+        log.info(f"  Upserted batch {batch_num}/{total_batches} ({written} new chunks)")
+        _notify("upserting", chunks=total_written,
                 detail=f"Upserted batch {batch_num}/{total_batches}")
 
-    final_count = collection.count()
-    log.info(f"✅ Ingestion complete. Collection now has {final_count} documents.")
-    _notify("completed", chunks=final_count, detail=f"Done! {final_count} documents in collection")
+    final_count = total_written
+    log.info(f"✅ Ingestion complete. Added {final_count} new documents to Qdrant.")
+    _notify("completed", chunks=final_count,
+            detail=f"Done! Added {final_count} new documents. Total in collection growing.")
 
 
 if __name__ == "__main__":

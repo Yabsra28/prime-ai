@@ -28,9 +28,9 @@ async def lifespan(app: FastAPI):
     log.info("🚀 Prime AI Math API starting up...")
     # Warm up the collection connection
     try:
-        from app.rag import get_collection
-        col = get_collection()
-        log.info(f"✅ ChromaDB ready — {col.count()} documents indexed")
+        from app.rag import get_doc_count
+        count = get_doc_count()
+        log.info(f"✅ Qdrant ready — {count} documents indexed")
     except Exception as e:
         log.warning(f"ChromaDB not ready yet (run ingest first): {e}")
     yield
@@ -94,7 +94,6 @@ class ContentResponse(BaseModel):
     content: str
     sources: list[SourceRef]
     status: str = "success"
-    from_cache: bool = False   # True = served from Redis/shelve, no OpenAI call made
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
@@ -107,10 +106,9 @@ async def root():
 @app.get("/health", tags=["Health"])
 async def health():
     try:
-        from app.rag import get_collection
-        col   = get_collection()
-        count = col.count()
-        return {"status": "healthy", "documents_indexed": count}
+        from app.rag import get_doc_count
+        count = get_doc_count()
+        return {"status": "healthy", "documents_indexed": count, "vector_store": "qdrant"}
     except Exception as e:
         return JSONResponse(status_code=503, content={"status": "unhealthy", "error": str(e)})
 
@@ -119,11 +117,9 @@ async def health():
 async def list_topics():
     """List all math topics available in the indexed textbook."""
     try:
-        from app.rag import get_collection
-        col     = get_collection()
-        results = col.get(include=["metadatas"])
-        topics  = list({m.get("topic", "unknown") for m in results["metadatas"]})
-        return {"topics": sorted(topics)}
+        from app.rag import get_topics
+        topics = get_topics()
+        return {"topics": topics}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -134,7 +130,7 @@ async def lesson_notes(req: TopicRequest):
     try:
         from app.rag import generate_lesson_notes
         result = generate_lesson_notes(req.topic, req.subtopic)
-        return ContentResponse(content=result["content"], sources=result["sources"], from_cache=result.get("from_cache", False))
+        return ContentResponse(content=result["content"], sources=result["sources"])
     except Exception as e:
         log.error(f"lesson_notes error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -146,7 +142,7 @@ async def generate_quiz(req: QuizRequest):
     try:
         from app.rag import generate_quiz
         result = generate_quiz(req.topic, req.difficulty, req.num_questions)
-        return ContentResponse(content=result["content"], sources=result["sources"], from_cache=result.get("from_cache", False))
+        return ContentResponse(content=result["content"], sources=result["sources"])
     except Exception as e:
         log.error(f"quiz error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -158,7 +154,7 @@ async def lesson_plan(req: LessonPlanRequest):
     try:
         from app.rag import generate_lesson_plan
         result = generate_lesson_plan(req.topic, req.duration_minutes)
-        return ContentResponse(content=result["content"], sources=result["sources"], from_cache=result.get("from_cache", False))
+        return ContentResponse(content=result["content"], sources=result["sources"])
     except Exception as e:
         log.error(f"lesson_plan error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -170,7 +166,7 @@ async def real_life_examples(req: RealLifeRequest):
     try:
         from app.rag import generate_real_life_examples
         result = generate_real_life_examples(req.topic, req.context_country)
-        return ContentResponse(content=result["content"], sources=result["sources"], from_cache=result.get("from_cache", False))
+        return ContentResponse(content=result["content"], sources=result["sources"])
     except Exception as e:
         log.error(f"real_life error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -183,30 +179,9 @@ async def chat(req: ChatRequest):
         from app.rag import chat_with_textbook
         history = [{"role": m.role, "content": m.content} for m in req.history]
         result  = chat_with_textbook(req.query, history)
-        return ContentResponse(content=result["content"], sources=result["sources"], from_cache=result.get("from_cache", False))
+        return ContentResponse(content=result["content"], sources=result["sources"])
     except Exception as e:
         log.error(f"chat error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/cache/stats", tags=["Admin"])
-async def get_cache_stats():
-    """Show Redis cache statistics — useful for verifying cache is working."""
-    try:
-        from app.rag import cache_stats
-        return cache_stats()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.delete("/cache/clear", tags=["Admin"])
-async def clear_cache():
-    """Clear all cached responses (use after re-ingesting textbook)."""
-    try:
-        from app.rag import cache_clear
-        cache_clear()
-        return {"status": "cleared"}
-    except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -264,6 +239,7 @@ async def ingest_pdf(
                 job["detail"] = f"Error: {str(e)[:200]}"
 
     background_tasks.add_task(run_ingest)
+    log.info(f"🚀 INGEST JOB STARTED | job_id={job_id} | file={file.filename} | pages={start_page}-{end_page or 'all'}")
     return {"message": f"Ingestion started for '{file.filename}'", "status": "processing", "job_id": job_id}
 
 
@@ -279,6 +255,27 @@ async def ingest_status(job_id: Optional[str] = None):
     # Return the most recent job
     latest_id = list(_ingest_jobs.keys())[-1]
     return {"job_id": latest_id, **_ingest_jobs[latest_id]}
+
+
+@app.get("/ingest/latest", tags=["Admin"])
+async def ingest_latest():
+    """Always returns the most recent ingest job — use this when job_id was lost due to timeout."""
+    if not _ingest_jobs:
+        return {"status": "no_jobs", "detail": "No ingestion jobs found. Start one via POST /ingest"}
+    latest_id = list(_ingest_jobs.keys())[-1]
+    job = _ingest_jobs[latest_id]
+    return {
+        "job_id":      latest_id,
+        "status":      job.get("status"),
+        "phase":       job.get("phase"),
+        "page":        job.get("page", 0),
+        "total_pages": job.get("total_pages", 0),
+        "chunks":      job.get("chunks", 0),
+        "detail":      job.get("detail", ""),
+        "filename":    job.get("filename", ""),
+        "started_at":  job.get("started_at"),
+        "all_jobs":    list(_ingest_jobs.keys()),
+    }
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
