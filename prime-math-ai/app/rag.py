@@ -279,7 +279,7 @@ def retrieve(query: str, n_results: int = 6, topic_filter: Optional[str] = None)
     q_embed = embed_query(query)
     kwargs = dict(
         collection_name=QDRANT_COLLECTION,
-        query_vector=q_embed,
+        query=q_embed,
         limit=min(n_results, count),
         with_payload=True,
     )
@@ -288,7 +288,7 @@ def retrieve(query: str, n_results: int = 6, topic_filter: Optional[str] = None)
             must=[FieldCondition(key="topic", match=MatchValue(value=topic_filter))]
         )
 
-    results = client.search(**kwargs)
+    results = client.query_points(**kwargs).points
     chunks  = []
     for r in results:
         log.info("  📄 Page %s | Topic: %s | Score: %.3f",
